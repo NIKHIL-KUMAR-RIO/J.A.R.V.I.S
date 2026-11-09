@@ -1,5 +1,8 @@
 import os
+import re
 import shutil
+import subprocess
+import time
 import platform
 from pathlib import Path
 from datetime import datetime
@@ -90,20 +93,50 @@ def _restore_from_trash(original: Path) -> str:
             f"automatically, but it is there and can be restored by hand.")
 
 
-_SAFE_ROOTS: list[Path] = [
-    Path.home(),
-]
+# ── Where the assistant may go ───────────────────────────────────────────────
+# Reading, listing and searching work on EVERY drive (C:, D:, E: ...).
+# Writing, moving, renaming, creating and deleting stay inside your home folder.
+# To let it change files on every drive too, set this to True.
+_ALLOW_FULL_WRITE = False
 
-def _is_safe_path(target: Path) -> bool:
-    """Is the given path inside _SAFE_ROOTS? If not, reject the operation."""
+# Extra folders (outside home) it may change even with the switch off, e.g.
+#   _EXTRA_WRITE_ROOTS = [Path(r"D:\Projects"), Path(r"E:\Backups")]
+_EXTRA_WRITE_ROOTS: list[Path] = []
+
+
+def _drive_roots() -> list[Path]:
+    """Every drive that exists: C:\\, D:\\ ... on Windows, / elsewhere."""
+    if _OS == "Windows":
+        import string
+        return [Path(f"{l}:\\") for l in string.ascii_uppercase
+                if os.path.exists(f"{l}:\\")]
+    return [Path("/")]
+
+
+_SAFE_ROOTS: list[Path] = [Path.home(), *_EXTRA_WRITE_ROOTS]
+
+
+def _inside(target: Path, roots) -> bool:
     try:
         resolved = target.resolve()
         return any(
-            resolved == root.resolve() or resolved.is_relative_to(root.resolve())
-            for root in _SAFE_ROOTS
+            resolved == r.resolve() or resolved.is_relative_to(r.resolve())
+            for r in roots
         )
     except Exception:
         return False
+
+
+def _is_safe_path(target: Path) -> bool:
+    """May the assistant CHANGE this path? (write / move / rename / delete)"""
+    if _ALLOW_FULL_WRITE:
+        return _inside(target, _drive_roots())
+    return _inside(target, _SAFE_ROOTS)
+
+
+def _is_readable_path(target: Path) -> bool:
+    """May the assistant LOOK at this path? Any drive."""
+    return _inside(target, _drive_roots())
 
 def _get_desktop() -> Path:
     if _OS == "Linux":
@@ -163,6 +196,11 @@ def _resolve_path(raw: str) -> Path:
     if lower in shortcuts:
         return shortcuts[lower]
 
+    # "d", "d:", "d drive", "drive d", "d:\\" -> the root of that drive
+    m = re.fullmatch(r"(?:drive\s+)?([a-z])(?::|\s+drive)?[\\/]?", lower)
+    if m and _OS == "Windows":
+        return Path(f"{m.group(1).upper()}:\\")
+
     # "desktop/notes/a.md" and "desktop\notes\a.md" — a shortcut followed by a
     # sub-path.  Without this branch the whole string falls through to the
     # relative-path return below and is resolved against the process CWD instead
@@ -198,7 +236,7 @@ def _safe_trash(target: Path) -> str:
 def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
     try:
         target = _resolve_path(path)
-        if not _is_safe_path(target):
+        if not _is_readable_path(target):
             return f"Access denied: {target}"
         if not target.exists():
             return f"Path not found: {target}"
@@ -224,6 +262,121 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
         return f"Permission denied: {path}"
     except Exception as e:
         return f"Error listing files: {e}"
+
+
+# ── Opening files in their normal program ────────────────────────────────────
+# Programs and scripts are never launched by voice: a misheard "open setup"
+# must not be able to run an installer.
+_BLOCKED_OPEN = {
+    ".exe", ".bat", ".cmd", ".com", ".msi", ".ps1", ".vbs", ".vbe", ".js",
+    ".jse", ".wsf", ".hta", ".scr", ".lnk", ".reg", ".dll", ".cpl", ".jar",
+    ".sh", ".command", ".app", ".appimage", ".desktop",
+}
+_SKIP_DIRS = {"$recycle.bin", "system volume information", "windows", "node_modules",
+              ".git", "__pycache__", "appdata", "program files", "program files (x86)"}
+
+
+def _launch(target: Path) -> None:
+    """Open with the default app (comes to the front like a double-click)."""
+    if _OS == "Windows":
+        os.startfile(str(target))                       # noqa
+    elif _OS == "Darwin":
+        subprocess.Popen(["open", str(target)])
+    else:
+        subprocess.Popen(["xdg-open", str(target)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _scan(base: Path, accept, deep: bool, limit_s: float = 6.0, max_dirs: int = 4000):
+    """Files under base that `accept(path)`. Shallow = base only."""
+    out, started, seen = [], time.time(), 0
+    if not deep:
+        try:
+            for item in base.iterdir():
+                if accept(item):
+                    out.append(item)
+        except Exception:
+            pass
+        return out
+    for root, dirs, files in os.walk(base):
+        seen += 1
+        if seen > max_dirs or time.time() - started > limit_s:
+            break
+        dirs[:] = [d for d in dirs
+                   if not d.startswith(".") and d.lower() not in _SKIP_DIRS]
+        for f in files:
+            p = Path(root) / f
+            if accept(p):
+                out.append(p)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def open_file(path: str, name: str = "", extension: str = "") -> str:
+    try:
+        base = _resolve_path(path)
+        if not _is_readable_path(base):
+            return f"Access denied: {base}"
+
+        ext = (extension or "").strip().lower()
+        if ext and not ext.startswith("."):
+            ext = "." + ext
+
+        # No name given: open the path itself (a file, or a folder in Explorer).
+        if not name:
+            target = base
+        else:
+            direct = base / name
+            if direct.exists():
+                target = direct
+            else:
+                if not base.is_dir():
+                    return f"Folder not found: {base}"
+                wanted_ext = ext or Path(name).suffix.lower()
+                stem = (Path(name).stem if Path(name).suffix else name).lower()
+
+                def ext_ok(p: Path) -> bool:
+                    return p.is_file() and (not wanted_ext or p.suffix.lower() == wanted_ext)
+
+                tiers = [
+                    lambda p: ext_ok(p) and p.stem.lower() == stem,
+                    lambda p: ext_ok(p) and stem in p.stem.lower(),
+                ]
+                matches: list[Path] = []
+                for accept in tiers:
+                    for deep in (False, True):
+                        matches = _scan(base, accept, deep)
+                        if matches:
+                            break
+                    if matches:
+                        break
+
+                if not matches:
+                    what = f"'{name}'" + (f" ({wanted_ext})" if wanted_ext else "")
+                    return f"I couldn't find {what} in {base}."
+                if len(matches) > 1:
+                    # prefer the shallowest ones; if still several, ask
+                    depth = lambda p: len(p.relative_to(base).parts)
+                    best = min(depth(p) for p in matches)
+                    matches = [p for p in matches if depth(p) == best]
+                if len(matches) > 1:
+                    names = ", ".join(f"{p.name} ({p.parent})" for p in matches[:5])
+                    return f"I found several matches, which one? {names}"
+                target = matches[0]
+
+        if not _is_readable_path(target):
+            return f"Access denied: {target}"
+        if not target.exists():
+            return f"Not found: {target}"
+        if target.is_file() and target.suffix.lower() in _BLOCKED_OPEN:
+            return (f"I won't launch '{target.name}' by voice — it's a program or "
+                    f"script. Open it yourself if you meant to.")
+
+        _launch(target)
+        return f"Opening {target.name}" + (f" from {target.parent}" if name else "")
+    except Exception as e:
+        return f"Could not open: {e}"
 
 
 def create_file(path: str, name: str = "", content: str = "") -> str:
@@ -335,7 +488,7 @@ def copy_file(path: str, name: str = "", destination: str = "") -> str:
             return f"Source not found: {src.name}"
         if dst is None:
             return "No destination specified."
-        if not _is_safe_path(src):
+        if not _is_readable_path(src):
             return f"Access denied (source): {src}"
         if not _is_safe_path(dst):
             return f"Access denied (destination): {dst}"
@@ -397,7 +550,7 @@ def read_file(path: str, name: str = "", max_chars: int = 4000) -> str:
     try:
         base   = _resolve_path(path)
         target = (base / name) if name else base
-        if not _is_safe_path(target):
+        if not _is_readable_path(target):
             return f"Access denied: {target}"
         if not target.exists():
             return f"File not found: {target.name}"
@@ -454,7 +607,7 @@ def find_files(name: str = "", extension: str = "",
                path: str = "home", max_results: int = 20) -> str:
     try:
         search_path = _resolve_path(path)
-        if not _is_safe_path(search_path):
+        if not _is_readable_path(search_path):
             return f"Access denied: {search_path}"
         if not search_path.exists():
             return f"Search path not found: {path}"
@@ -494,7 +647,7 @@ def get_largest_files(path: str = "downloads", count: int = 10) -> str:
     count = min(count, 50)  # maksimum 50
     try:
         search_path = _resolve_path(path)
-        if not _is_safe_path(search_path):
+        if not _is_readable_path(search_path):
             return f"Access denied: {search_path}"
         if not search_path.exists():
             return f"Path not found: {path}"
@@ -625,7 +778,7 @@ def get_file_info(path: str, name: str = "") -> str:
     try:
         base   = _resolve_path(path)
         target = (base / name) if name else base
-        if not _is_safe_path(target):
+        if not _is_readable_path(target):
             return f"Access denied: {target}"
         if not target.exists():
             return f"Not found: {target.name}"
@@ -662,6 +815,9 @@ def file_controller(
     try:
         if action == "list":
             return list_files(path)
+
+        elif action == "open":
+            return open_file(path, name=name, extension=params.get("extension", ""))
 
         elif action == "create_file":
             return create_file(path, name=name, content=params.get("content", ""))
@@ -724,17 +880,17 @@ def file_controller(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_controller",
-    "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+    "description": "Manages files and folders on any drive: open, list, create, delete, move, copy, rename, read, write, find, disk usage. To OPEN a file or folder in its normal program (a PDF, video, document, image) use action=open with the folder in path, the file name in name, and the type in extension (e.g. .pdf). Do NOT use open_app for opening a file.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"
+                "description": "open | list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"
             },
             "path": {
                 "type": "STRING",
-                "description": "File/folder path or shortcut: desktop, downloads, documents, home"
+                "description": "File/folder path or shortcut: desktop, downloads, documents, home, or a full path / drive such as D:\\\\Projects or E:"
             },
             "destination": {
                 "type": "STRING",
@@ -750,7 +906,7 @@ TOOL = {
             },
             "name": {
                 "type": "STRING",
-                "description": "File name to search for"
+                "description": "File name (the extension may be left out), e.g. new"
             },
             "extension": {
                 "type": "STRING",

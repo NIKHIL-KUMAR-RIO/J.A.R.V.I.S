@@ -56,12 +56,12 @@ def is_ready() -> bool:
         models_dir = Path(openwakeword.__file__).resolve().parent / "resources" / "models"
         if not models_dir.is_dir():
             return False
-        has_wake = (any(models_dir.glob(f"{WAKE_MODEL}*.onnx"))
-                    or any(models_dir.glob(f"{WAKE_MODEL}*.tflite")))
-        has_mel = (any(models_dir.glob("melspectrogram*.onnx"))
-                   or any(models_dir.glob("melspectrogram*.tflite")))
-        has_emb = (any(models_dir.glob("embedding_model*.onnx"))
-                   or any(models_dir.glob("embedding_model*.tflite")))
+        def _valid(pattern: str) -> bool:
+            return any(p.is_file() and p.stat().st_size > 50_000 for p in models_dir.glob(pattern))
+
+        has_wake = _valid(f"{WAKE_MODEL}*.onnx") or _valid(f"{WAKE_MODEL}*.tflite")
+        has_mel  = _valid("melspectrogram*.onnx") or _valid("melspectrogram*.tflite")
+        has_emb  = _valid("embedding_model*.onnx") or _valid("embedding_model*.tflite")
         return bool(has_wake and has_mel and has_emb)
     except Exception:
         return False
