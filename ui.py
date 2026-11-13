@@ -204,50 +204,6 @@ def qcol(h: str, a: int = 255) -> QColor:
     c = QColor(h); c.setAlpha(a); return c
 
 
-# ── Windows GPU via NVML DLL (no subprocess, no console window) ──────────────
-_nvml_lib: object = None   # cached ctypes DLL
-_nvml_ok:  object = None   # None=untested, True=works, False=unavailable
-
-
-def _nvml_gpu_windows() -> float:
-    """Return NVIDIA GPU utilisation % using nvml.dll directly — zero subprocess."""
-    global _nvml_lib, _nvml_ok
-    if _nvml_ok is False:
-        return -1.0
-    try:
-        import ctypes
-
-        class _Util(ctypes.Structure):
-            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
-
-        if _nvml_lib is None:
-            for dll_name in ("nvml", r"C:\Windows\System32\nvml.dll"):
-                try:
-                    lib = ctypes.WinDLL(dll_name)
-                    lib.nvmlInit_v2()
-                    _nvml_lib = lib
-                    break
-                except Exception:
-                    continue
-
-        if _nvml_lib is None:
-            import pynvml  # type: ignore
-            pynvml.nvmlInit()
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            _nvml_ok = True
-            return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
-
-        dev = ctypes.c_void_p()
-        _nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
-        util = _Util()
-        _nvml_lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(util))
-        _nvml_ok = True
-        return float(util.gpu)
-    except Exception:
-        _nvml_ok = False
-        return -1.0
-
-
 class _SysMetrics:
     def __init__(self):
         self.cpu  = 0.0
@@ -259,16 +215,8 @@ class _SysMetrics:
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.time()
         self._running = True
-        # Probe caches — GPU (NVML) and temperature (WMI) are the expensive
-        # queries; initialise their handles once and reuse them instead of
-        # rebuilding a connection on every poll.
-        self._slow_tick = 0            # gpu/temp refreshed every 3rd cycle
-        self._pynvml    = None         # cached pynvml module + device handle
-        self._pynvml_h  = None
-        self._pynvml_ok = None         # None=untested, False=unavailable here
-        self._nv_unix   = None         # cached (lib, dev) for Linux/macOS NVML
-        self._wmi_conn  = None         # cached WMI connection (creating one is slow)
-        self._wmi_ok    = None         # None=untested, False=unavailable here
+        # GPU and temperature are probed every 3rd cycle (~6 s) in shared helper.
+        self._slow_tick = 0
         t = threading.Thread(target=self._loop, daemon=True)
         t.start()
 
@@ -315,79 +263,18 @@ class _SysMetrics:
             self.tmp = tmp
 
     def _get_gpu(self) -> float:
-        # pynvml — subprocess-free; initialise once and reuse the handle.
-        # Re-initialising NVML on every poll is slow, so cache it and stop
-        # retrying pynvml entirely once it proves unavailable here.
-        if self._pynvml_ok is not False:
-            try:
-                if self._pynvml_h is None:
-                    import pynvml  # type: ignore
-                    pynvml.nvmlInit()
-                    self._pynvml    = pynvml
-                    self._pynvml_h  = pynvml.nvmlDeviceGetHandleByIndex(0)
-                    self._pynvml_ok = True
-                return float(self._pynvml.nvmlDeviceGetUtilizationRates(self._pynvml_h).gpu)
-            except Exception:
-                self._pynvml_ok = False
-
-        # Windows: nvml.dll via ctypes (already cached in _nvml_gpu_windows)
-        if _OS == "Windows":
-            return _nvml_gpu_windows()
-
-        # Linux / macOS: libnvidia-ml shared lib via ctypes — init once, reuse
         try:
-            import ctypes
-
-            class _Util(ctypes.Structure):
-                _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
-
-            if self._nv_unix is None:
-                _lib = "libnvidia-ml.so.1" if _OS == "Linux" else "libnvidia-ml.dylib"
-                nv = ctypes.CDLL(_lib)
-                nv.nvmlInit_v2()
-                dev = ctypes.c_void_p()
-                nv.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
-                self._nv_unix = (nv, dev)
-
-            nv, dev = self._nv_unix
-            u = _Util()
-            nv.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(u))
-            return float(u.gpu)
+            from actions.system_monitor import _get_gpu_usage
+            return float(_get_gpu_usage())
         except Exception:
-            pass
-
-        return -1.0   # N/A — zero subprocess on all platforms
+            return -1.0
 
     def _get_temp(self) -> float:
-        # psutil — works on Linux; occasionally Windows with driver support
         try:
-            temps = psutil.sensors_temperatures()
-            for name in ["coretemp", "k10temp", "cpu_thermal", "acpitz",
-                         "cpu-thermal", "zenpower", "it8688"]:
-                if name in temps and temps[name]:
-                    return temps[name][0].current
-            for entries in temps.values():
-                if entries:
-                    return entries[0].current
+            from actions.system_monitor import _get_cpu_temp
+            return float(_get_cpu_temp())
         except Exception:
-            pass
-
-        # Windows: wmi module (pure Python COM, zero subprocess). Reuse a single
-        # connection — building a fresh wmi.WMI() on every poll spins up a COM
-        # connection each time and is very slow. Give up after one failure.
-        if _OS == "Windows" and self._wmi_ok is not False:
-            try:
-                if self._wmi_conn is None:
-                    import wmi  # type: ignore
-                    self._wmi_conn = wmi.WMI(namespace="root/wmi")
-                tz = self._wmi_conn.MSAcpi_ThermalZoneTemperature()
-                if tz:
-                    return (tz[0].CurrentTemperature / 10.0) - 273.15
-            except Exception:
-                self._wmi_ok   = False
-                self._wmi_conn = None
-
-        return -1.0   # N/A — zero subprocess on all platforms
+            return -1.0
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -402,20 +289,48 @@ class _SysMetrics:
 
 _metrics = _SysMetrics()
 
+from PyQt6.QtGui import QPolygonF
+
+
+def _matMul3x3(A, B):
+    C_m = [0.0] * 9
+    for i in range(3):
+        for j in range(3):
+            C_m[i*3 + j] = A[i*3 + 0]*B[0*3 + j] + A[i*3 + 1]*B[1*3 + j] + A[i*3 + 2]*B[2*3 + j]
+    return C_m
+
+
+def _eulerRot(rx, ry, rz):
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    Rx = [1,0,0,  0,cx,-sx,  0,sx,cx]
+    Ry = [cy,0,sy,  0,1,0,  -sy,0,cy]
+    Rz = [cz,-sz,0,  sz,cz,0,  0,0,1]
+    return _matMul3x3(Rz, _matMul3x3(Ry, Rx))
+
+
+def _transformVec(v, M):
+    return (
+        v[0]*M[0] + v[1]*M[1] + v[2]*M[2],
+        v[0]*M[3] + v[1]*M[4] + v[2]*M[5],
+        v[0]*M[6] + v[1]*M[7] + v[2]*M[8]
+    )
+
+
 class HudCanvas(QWidget):
     def __init__(self, face_path: str, assistant_name: str = "J.A.R.V.I.S", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.setMinimumSize(300, 300)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
 
         self.muted    = False
         self.speaking = False
         self.state    = "INITIALISING"
         self._assistant_name = assistant_name
 
-        # The holographic head that fills the HUD. If it could not be imported
-        # we fall back to the old glowing core so the panel is never empty.
         self._avatar = None
         if HoloAvatar is not None:
             try:
@@ -423,15 +338,11 @@ class HudCanvas(QWidget):
             except Exception:
                 self._avatar = None
 
-        # Which centrepiece to draw. Read once here and changed live by the
-        # settings toggle; the avatar object is kept either way so switching
-        # back is instant and costs no reload.
         try:
             from memory.config_manager import get_hud_style
             self.hud_style = get_hud_style()
         except Exception:
-            self.hud_style = "face"
-        self._core_phase = 0.0
+            self.hud_style = "core"
 
         self._tick       = 0
         self._scale      = 1.0
@@ -443,33 +354,110 @@ class HudCanvas(QWidget):
         self._blink      = True
         self._blink_tick = 0
 
-        # Rescaled-face cache: the smooth rescale is expensive, so we keep the
-        # last result and only rebuild it when the (quantised) size changes.
-
-        # Static grid-dot layer, pre-rendered once per size/theme into a pixmap
-        # so paintEvent blits it in one call instead of thousands of drawPoint()s.
         self._grid_cache: QPixmap | None = None
         self._grid_key = None
-        # Repaint throttle counter (idle frames drop to ~20 Hz — see _step()).
         self._paint_tick = 0
 
-        # Live audio reactivity: _live_amp is written from the audio threads
-        # (0.0–1.0), _amp_disp is the smoothed value the paint code reads.
         self._live_amp  = 0.0
         self._amp_disp  = 0.0
-        # (frames, start_time, hop) posted by the playback thread — see
-        # push_visemes(). None means "no schedule; use the plain level".
         self._visemes = None
-        self._vis_i = None        # first schedule frame not yet handed to the mouth
-        self._base_scale = 1.0    # slow "breathing" target; amp is added per-frame
+        self._vis_i = None
+        self._base_scale = 1.0
         self._base_halo  = 55.0
+
+        # Interactive 3D Orbit & Mouse Tracking
+        self._user_rot_x = 0.0
+        self._user_rot_y = 0.0
+        self._vel_rot_x = 0.0
+        self._vel_rot_y = 0.0
+        self._dragging = False
+        self._last_mouse_pos = QPoint()
+        self._orb_center = QPointF(150, 150)
+        self._orb_radius = 120.0
+
+        # State-dependent kinematic and optical physics targets (exact match to HTML engine)
+        self._base_time = 0.0
+        self._tNorm = 0.0
+        self._current_speed = 0.15
+        self._cur_radius_scale = 1.12
+        self._cur_planar_fold = 0.0
+        self._cur_forward_tilt = 0.20
+        self._cur_bloom = 1.05
+        self._cur_core_scale = 1.35
+        self._cur_circuit_activity = 0.4
+        self._cur_armor_interlock = 0.0
+
+        # 1. 480 Particles (deterministic seed 42)
+        random.seed(42)
+        self._particles = []
+        for _ in range(480):
+            self._particles.append({
+                'r': 35.0 + random.uniform(0.0, 390.0),
+                'u0': random.uniform(0.0, 2 * math.pi),
+                'v0': random.uniform(0.0, 2 * math.pi),
+                'fa': random.choice([1, -1, 2, -2, 3]),
+                'fb': random.choice([1, -1, 2, -2]),
+                'size': 1.0 + random.uniform(0.0, 2.2),
+                'bright': 0.6 + random.uniform(0.0, 0.6),
+                'type': 'white' if random.random() > 0.8 else ('gold' if random.random() > 0.35 else 'amber')
+            })
+
+        # 2. 32 Dendritic Circuit Branches (Energy signals)
+        self._circuit_branches = []
+        for b in range(32):
+            base_ang = b * (2 * math.pi / 32)
+            r_pt = 55.0 + random.uniform(0.0, 25.0)
+            th_pt = base_ang
+            z_pt = (random.random() - 0.5) * 20.0
+            pts = [[r_pt, th_pt, z_pt]]
+            steps = 6 + random.randint(0, 3)
+            for s in range(steps):
+                r_pt += 25.0 + random.uniform(0.0, 25.0)
+                th_pt += (random.random() - 0.5) * 0.22
+                z_pt += (random.random() - 0.5) * 15.0
+                pts.append([r_pt, th_pt, z_pt])
+                if r_pt > 360.0:
+                    break
+            self._circuit_branches.append({
+                'pts': pts,
+                'ring': random.choice([2, 3, 4]),
+                'speed': float(random.choice([1, 2, 3])),
+                'offset': random.random()
+            })
+
+        # 3. 5 Segmented Arc Shields
+        self._shields = [
+            {'start': 0.18 * math.pi, 'end': 0.62 * math.pi, 'rIn': 345.0, 'rOut': 385.0, 'segs': 18, 'ring': 1},
+            {'start': 0.92 * math.pi, 'end': 1.48 * math.pi, 'rIn': 348.0, 'rOut': 390.0, 'segs': 22, 'ring': 1},
+            {'start': 1.62 * math.pi, 'end': 2.05 * math.pi, 'rIn': 342.0, 'rOut': 382.0, 'segs': 16, 'ring': 1},
+            {'start': 0.08 * math.pi, 'end': 0.52 * math.pi, 'rIn': 290.0, 'rOut': 320.0, 'segs': 14, 'ring': 2},
+            {'start': 1.05 * math.pi, 'end': 1.58 * math.pi, 'rIn': 292.0, 'rOut': 322.0, 'segs': 16, 'ring': 2},
+        ]
+
+        # 4. 28 3D Chords
+        self._chords = []
+        for i in range(28):
+            self._chords.append({
+                'r1': 360.0, 'a1': i * (2 * math.pi / 28), 'ring1': 1,
+                'r2': 260.0, 'a2': ((i * 3) % 28) * (2 * math.pi / 28), 'ring2': 3
+            })
+
+        # 5. 7 Concentric Gimbal Rings
+        self._gimbal_rings = [
+            {'rid': 1, 'r': 375.0, 'segs': 140, 'col': QColor(255, 190, 11), 'thk': 2.2, 'enc': True},
+            {'rid': 1, 'r': 360.0, 'segs': 120, 'col': QColor(251, 86, 7),   'thk': 1.2, 'enc': False},
+            {'rid': 2, 'r': 315.0, 'segs': 120, 'col': QColor(255, 190, 11), 'thk': 2.0, 'enc': True},
+            {'rid': 2, 'r': 300.0, 'segs': 100, 'col': QColor(251, 86, 7),   'thk': 1.2, 'enc': False},
+            {'rid': 3, 'r': 255.0, 'segs': 100, 'col': QColor(255, 190, 11), 'thk': 1.8, 'enc': True},
+            {'rid': 4, 'r': 205.0, 'segs': 90,  'col': QColor(255, 170, 0),  'thk': 1.6, 'enc': False},
+            {'rid': 5, 'r': 160.0, 'segs': 80,  'col': QColor(255, 209, 102), 'thk': 1.6, 'enc': False},
+        ]
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._tmr.start(16)
 
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
-        """Ask the avatar to look somewhere for a moment (see HoloAvatar.glance)."""
         try:
             if self._avatar is not None:
                 self._avatar.glance(dx, dy, hold)
@@ -477,27 +465,6 @@ class HudCanvas(QWidget):
             pass
 
     def push_visemes(self, frames, hop: float, at: float) -> None:
-        """Thread-safe: hand over a schedule of (level, openness, width) frames.
-
-        The playback thread writes up to 200 ms of audio in one go, so a single
-        averaged level would only move the mouth five times a second — enough to
-        flap, nowhere near enough to articulate. It instead posts the whole
-        slice's worth of 20 ms frames here and `_step()` plays them out against
-        the wall clock, in step with the audio going to the speakers.
-
-        `at` is the wall-clock time this batch will *begin to sound*, which the
-        caller tracks as a playback cursor. It is not the time of the call, and
-        the difference is the whole point: `stream.write` returns once the buffer
-        accepts the samples, so consecutive batches are handed over far faster
-        than they play. Anchoring each one to "now" made every batch start while
-        its predecessor was still sounding, so each schedule replaced the last
-        after a couple of frames and the mouth only ever played the opening
-        instant of every 200 ms — the reason it did not match the words.
-
-        Successive batches are therefore *appended* into one continuous
-        timeline, not swapped in. A paragraph is one schedule; the mouth stops
-        falling into a gap at every chunk boundary and having to climb back out.
-        """
         try:
             if not frames:
                 return
@@ -508,13 +475,8 @@ class HudCanvas(QWidget):
             if cur is not None:
                 old, t0, ohop = cur
                 if abs(ohop - hop) < 1e-6:
-                    # Where in the existing timeline does this batch land?
                     i = int(round((at - t0) / hop))
                     if 0 <= i <= len(old) + 1:
-                        # Continues (or slightly overlaps) what is already
-                        # queued: extend rather than restart. Drop whatever has
-                        # already been played so the list cannot grow without
-                        # bound over a long reply.
                         merged = old[:i] + new
                         played = int((time.time() - t0) / hop) - 2
                         if played > 60:
@@ -530,9 +492,6 @@ class HudCanvas(QWidget):
             pass
 
     def set_audio_level(self, level: float) -> None:
-        """Thread-safe entry point for the audio threads. Stores the louder of
-        the incoming level and the current value so brief gaps between chunks
-        don't make the waveform stutter; _step() decays it back down."""
         try:
             lv = float(level)
         except (TypeError, ValueError):
@@ -545,9 +504,6 @@ class HudCanvas(QWidget):
             self._live_amp = lv
 
     def _make_grid(self, W: int, H: int) -> QPixmap:
-        """Pre-render the static grid-dot background into a transparent pixmap so
-        paintEvent can blit it once per frame instead of running a nested
-        drawPoint() loop across the whole widget every 16 ms."""
         pm = QPixmap(max(1, W), max(1, H))
         pm.fill(Qt.GlobalColor.transparent)
         gp = QPainter(pm)
@@ -558,14 +514,68 @@ class HudCanvas(QWidget):
         gp.end()
         return pm
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._last_mouse_pos = event.position().toPoint() if hasattr(event, 'position') else event.pos()
+            self._vel_rot_x = 0.0
+            self._vel_rot_y = 0.0
+            self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+            event.accept()
+        try:
+            super().mousePressEvent(event)
+        except Exception:
+            pass
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint() if hasattr(event, 'position') else event.pos()
+        if self._dragging:
+            dx = pos.x() - self._last_mouse_pos.x()
+            dy = pos.y() - self._last_mouse_pos.y()
+            self._user_rot_y += dx * 0.006
+            self._user_rot_x += dy * 0.006
+            self._vel_rot_y = dx * 0.006
+            self._vel_rot_x = dy * 0.006
+            self._last_mouse_pos = pos
+            self.update()
+            event.accept()
+        else:
+            dist = math.hypot(pos.x() - self._orb_center.x(), pos.y() - self._orb_center.y())
+            if dist <= self._orb_radius * 1.2:
+                self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+            else:
+                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        try:
+            super().mouseMoveEvent(event)
+        except Exception:
+            pass
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+            event.accept()
+        try:
+            super().mouseReleaseEvent(event)
+        except Exception:
+            pass
+
+    def mouseDoubleClickEvent(self, event):
+        self._user_rot_x = 0.0
+        self._user_rot_y = 0.0
+        self._vel_rot_x = 0.0
+        self._vel_rot_y = 0.0
+        self.update()
+        event.accept()
+        try:
+            super().mouseDoubleClickEvent(event)
+        except Exception:
+            pass
+
     def _step(self):
         self._tick += 1
         now = time.time()
 
-        # ── Live audio reactivity ────────────────────────────────────────────
-        # A viseme schedule, if one is playing, gives both the level and the
-        # mouth shape for this exact instant; otherwise fall back to the peak
-        # level the audio threads pushed in.
         v_open = v_wide = v_level = None
         v_seq = None
         sched = self._visemes
@@ -573,12 +583,6 @@ class HudCanvas(QWidget):
             frames, t0, hop = sched
             i = int((now - t0) / hop)
             if 0 <= i < len(frames):
-                # Hand over *every* frame since the last tick, not just the one
-                # under the cursor. This timer runs at 60 Hz but the paint is
-                # throttled and the machine may be busy, so a tick can span two
-                # or three 20 ms frames — and a consonant closure is only two
-                # frames long. Sampling one and discarding the rest is how the
-                # closures between words went missing.
                 j = self._vis_i if self._vis_i is not None else i
                 v_seq = frames[max(0, j):i + 1]
                 self._vis_i = max(j, i + 1)
@@ -588,23 +592,84 @@ class HudCanvas(QWidget):
                     if peak > self._live_amp:
                         self._live_amp = peak
             elif i >= len(frames):
-                self._visemes = None        # schedule spent
+                self._visemes = None
                 self._vis_i = None
 
-        # Audio threads push peaks into _live_amp; decay it toward silence so
-        # gaps between chunks fade out instead of freezing, then smooth it.
         self._live_amp *= 0.86
         self._amp_disp += (self._live_amp - self._amp_disp) * 0.45
         amp = self._amp_disp
 
-        # The avatar animates off the very same smoothed level the waveform
-        # uses — one audio source, so the mouth can never drift out of sync.
         dt = now - self._step_t
         self._step_t = now
-        # Integrated, not derived from absolute time: multiplying wall-clock by
-        # a rate that changes with state jumps the rings the instant JARVIS
-        # starts talking. Same lesson the head's sway taught.
-        self._core_phase += min(0.10, max(0.0, dt))
+
+        # State Speed Targets (Obeying User Preferences)
+        # Sleeping = 0.07x, Muted = 0.04x, Listening = 0.15x, Speaking = 0.28x, Thinking = 0.50x
+        if self.muted:
+            tgt_spd = 0.04
+            tgt_rad = 0.94
+            tgt_fold = 0.05
+            tgt_tilt = 0.0
+            tgt_bloom = 0.15
+            tgt_core = 0.0
+            tgt_circuit = 0.0
+            tgt_armor = 1.0
+        elif self.speaking:
+            tgt_spd = 0.28
+            tgt_rad = 1.04
+            tgt_fold = 0.0
+            tgt_tilt = 0.08
+            tgt_bloom = 1.35
+            tgt_core = 1.20
+            tgt_circuit = 1.4
+            tgt_armor = 0.0
+        elif self.state in ("THINKING", "PROCESSING"):
+            tgt_spd = 0.50
+            tgt_rad = 1.00
+            tgt_fold = 0.0
+            tgt_tilt = 0.0
+            tgt_bloom = 1.85
+            tgt_core = 1.15
+            tgt_circuit = 4.2
+            tgt_armor = 0.0
+        elif self.state == "LISTENING":
+            tgt_spd = 0.15
+            tgt_rad = 1.12
+            tgt_fold = 0.0
+            tgt_tilt = 0.20
+            tgt_bloom = 1.05
+            tgt_core = 1.35
+            tgt_circuit = 0.4
+            tgt_armor = 0.0
+        else: # SLEEPING / IDLE
+            tgt_spd = 0.07
+            tgt_rad = 0.90
+            tgt_fold = 0.85
+            tgt_tilt = 0.0
+            tgt_bloom = 0.35
+            tgt_core = 0.40
+            tgt_circuit = 0.1
+            tgt_armor = 0.0
+
+        lerp_f = min(1.0, dt * 5.0)
+        self._current_speed += (tgt_spd - self._current_speed) * lerp_f
+        self._cur_radius_scale += (tgt_rad - self._cur_radius_scale) * lerp_f
+        self._cur_planar_fold += (tgt_fold - self._cur_planar_fold) * lerp_f
+        self._cur_forward_tilt += (tgt_tilt - self._cur_forward_tilt) * lerp_f
+        self._cur_bloom += (tgt_bloom - self._cur_bloom) * lerp_f
+        self._cur_core_scale += (tgt_core - self._cur_core_scale) * lerp_f
+        self._cur_circuit_activity += (tgt_circuit - self._cur_circuit_activity) * lerp_f
+        self._cur_armor_interlock += (tgt_armor - self._cur_armor_interlock) * lerp_f
+
+        # Advance 3D orbit phase (8s fundamental loop)
+        self._base_time = (self._base_time + dt * self._current_speed) % 8.0
+        self._tNorm = self._base_time / 8.0
+
+        # Apply drag inertia damping
+        if not self._dragging:
+            self._user_rot_x += self._vel_rot_x
+            self._user_rot_y += self._vel_rot_y
+            self._vel_rot_x *= 0.90
+            self._vel_rot_y *= 0.90
 
         if self._avatar is not None and self.hud_style == "face":
             self._avatar.step(dt, amp, speaking=self.speaking,
@@ -612,32 +677,6 @@ class HudCanvas(QWidget):
                               v_open=v_open, v_wide=v_wide or 0.0,
                               v_level=v_level, v_seq=v_seq,
                               v_hop=(sched[2] if sched is not None else 0.02))
-        else:
-            # Fallback core: slow "breathing" base target, lifted by the level.
-            if now - self._last_t > (0.12 if self.speaking else 0.5):
-                if self.speaking:
-                    self._base_scale = 1.03
-                    self._base_halo  = 122.0
-                elif self.muted:
-                    self._base_scale = random.uniform(0.998, 1.002)
-                    self._base_halo  = random.uniform(15, 28)
-                else:
-                    self._base_scale = random.uniform(1.001, 1.008)
-                    self._base_halo  = random.uniform(48, 68)
-                self._last_t = now
-
-            if self.muted:
-                self._tgt_scale, self._tgt_halo = self._base_scale, self._base_halo
-            elif self.speaking:
-                self._tgt_scale = self._base_scale + amp * 0.13
-                self._tgt_halo  = self._base_halo  + amp * 95.0
-            else:
-                self._tgt_scale = self._base_scale + amp * 0.06
-                self._tgt_halo  = self._base_halo  + amp * 75.0
-
-            sp = 0.38 if self.speaking else (0.30 if amp > 0.02 else 0.15)
-            self._scale += (self._tgt_scale - self._scale) * sp
-            self._halo  += (self._tgt_halo  - self._halo)  * sp
 
         self._blink_tick += 1
         if self._blink_tick >= 38:
@@ -647,41 +686,57 @@ class HudCanvas(QWidget):
         else:
             _blinked = False
 
-        # Repaint throttling — advancing the animation state above is cheap at
-        # 60 Hz, but the paint is heavy. Active (speaking, audio, thinking) runs
-        # at ~30 Hz, which is the frame rate animation has used for talking
-        # characters forever and is indistinguishable here; idle drops to ~20 Hz
-        # so a sleeping HUD stops pinning a CPU core. The visuals stay smooth
-        # either way because the animation state keeps stepping at 60 Hz.
-        self._paint_tick = (self._paint_tick + 1) % 6
-        active = (self.speaking or amp > 0.02
-                  or self.state in ("THINKING", "PROCESSING"))
-        if _blinked or (self._paint_tick % 2 == 0 if active
-                        else self._paint_tick % 3 == 0):
-            # Nothing is on screen when the window is hidden or minimised, so
-            # rendering the avatar into it is pure waste — and this app is meant
-            # to sit running all day. The animation state above keeps stepping,
-            # so it picks up mid-motion instead of snapping when you come back.
+        self._paint_tick = (self._paint_tick + 1) % 4
+        active = (self.speaking or amp > 0.02 or self.state in ("THINKING", "PROCESSING") or self._dragging or abs(self._vel_rot_x) > 0.0001 or abs(self._vel_rot_y) > 0.0001)
+        if _blinked or (self._paint_tick % 2 == 0 if active else self._paint_tick == 0):
             if self._on_screen():
                 self.update()
 
     def _on_screen(self) -> bool:
-        """True only when this canvas can actually be seen by the user."""
         try:
             if not self.isVisible():
                 return False
             win = self.window()
             return not (win.isMinimized() or win.isHidden())
         except Exception:
-            return True      # never let a visibility check stop the HUD drawing
+            return True
 
-    # ── reactor core ─────────────────────────────────────────────────────────
-    # The centrepiece for anyone who did not want a face looking back at them.
-    # Built from the same budget as the head — software QPainter, no GPU — and
-    # from the same principle: everything on it means something. The rings turn
-    # at a rate the state sets, the spectrum ring is the real audio level, and
-    # the core brightens with the voice. Nothing here is decoration that moves
-    # for its own sake, which is what made the old glowing orb feel dead.
+    def getRingMat(self, rid, t):
+        k = 1
+        if rid == 1:
+            rx, ry, k = 0.42, 0.28, -1
+        elif rid == 2:
+            rx, ry, k = -0.59, -0.45, 1
+        elif rid == 3:
+            rx, ry, k = 0.91, -0.35, -1
+        elif rid == 4:
+            rx, ry, k = -0.38, 0.84, 1
+        elif rid == 5:
+            rx, ry, k = 1.22, 0.21, -2
+        elif rid == 'core_inner':
+            rx, ry, k = 0.1, -0.07, 3
+        elif rid == 'core_eye':
+            rx, ry, k = -0.07, 0.14, -2
+        else:
+            rx, ry, k = 0.0, 0.0, 1
+
+        rx = rx * (1.0 - self._cur_planar_fold)
+        ry = ry * (1.0 - self._cur_planar_fold)
+        rx += self._cur_forward_tilt
+
+        return _matMul3x3(_eulerRot(rx, ry, 0.0), _eulerRot(0.0, 0.0, 2.0 * math.pi * k * t))
+
+    def projectPt(self, v, camPos, camRot, f, cx, cy):
+        rx = v[0] - camPos[0]
+        ry = v[1] - camPos[1]
+        rz = v[2] - camPos[2]
+
+        x = rx*camRot[0] + ry*camRot[1] + rz*camRot[2]
+        y = rx*camRot[3] + ry*camRot[4] + rz*camRot[5]
+        z = rx*camRot[6] + ry*camRot[7] + rz*camRot[8]
+
+        zSafe = max(30.0, z)
+        return cx + f * (x / zSafe), cy - f * (y / zSafe), z
 
     def _core_colours(self):
         if self.muted:
@@ -696,152 +751,334 @@ class HudCanvas(QWidget):
 
     def _paint_core(self, p: QPainter, cx: float, cy: float, r: float,
                     W: float = 0.0, H: float = 0.0):
-        """Draw the reactor at (cx, cy) with outer radius r, using the whole
-        canvas (W x H) for the marks that frame it."""
-        main, acc = self._core_colours()
-        bg = qcol(C.BG)
+        self._orb_center = QPointF(cx, cy)
+        self._orb_radius = r
+
+        tNorm = self._tNorm
         amp = self._amp_disp
-        t = self._core_phase
-        live = (self.speaking or amp > 0.04) and not self.muted
+        curRadiusScale = self._cur_radius_scale
+        curCoreScale = self._cur_core_scale
+        curBloom = self._cur_bloom
+        curArmorInterlock = self._cur_armor_interlock
+        curCircuitActivity = self._cur_circuit_activity
 
-        def blend(col: QColor, a: float) -> QColor:
-            """Pre-mix onto the background instead of asking Qt to composite.
-            The raster engine's opaque path is several times faster than its
-            translucent one, and everything here is a line or an arc."""
-            k = max(0.0, min(1.0, a))
-            return QColor(int(bg.red()   + (col.red()   - bg.red())   * k),
-                          int(bg.green() + (col.green() - bg.green()) * k),
-                          int(bg.blue()  + (col.blue()  - bg.blue())  * k))
+        is_muted = self.muted
+        is_speaking = self.speaking
+        is_thinking = self.state in ("THINKING", "PROCESSING")
+        is_listening = (self.state == "LISTENING")
+        is_sleeping = not (is_muted or is_speaking or is_thinking or is_listening)
 
-        p.setBrush(Qt.BrushStyle.NoBrush)
+        breathPulse = (0.6 + 0.4 * math.sin(self._tick * 0.04)) if is_sleeping else 1.0
 
-        # 1. The atmosphere. One radial gradient doing what a stack of discs did
-        #    badly: a wide, soft body of light that gives the thing presence
-        #    before any detail is read. This single element decides whether the
-        #    HUD looks vast or looks small, so it is drawn first and drawn big.
-        # Concentrated rather than spread: a gradient reaching the outer rim
-        # washes the whole disc a flat dim blue and reads as fog. Ending it at
-        # two thirds leaves it a body of light with somewhere to fall off to,
-        # which is what makes it look lit rather than tinted.
-        lift = 1.0 + 0.55 * amp + (0.18 if self.speaking else 0.0)
-        p.setPen(Qt.PenStyle.NoPen)
-        for gr, a0, a1 in ((r * 0.70, 0.30, 0.0), (r * 0.34, 0.34, 0.0)):
-            g = QRadialGradient(cx, cy, gr)
-            g.setColorAt(0.00, blend(main, min(0.95, a0 * lift)))
-            g.setColorAt(0.45, blend(main, min(0.95, a0 * lift * 0.52)))
-            g.setColorAt(0.78, blend(main, min(0.95, a0 * lift * 0.18)))
-            g.setColorAt(1.00, blend(main, a1))
-            p.setBrush(QBrush(g))
-            p.drawEllipse(QRectF(cx - gr, cy - gr, gr * 2, gr * 2))
-        p.setBrush(Qt.BrushStyle.NoBrush)
+        scale = r / 305.0
+        f = 900.0 * scale
+        cameraDistance = 1150.0
 
-        # 2. Frame marks at the corners of the whole canvas, not of the circle.
-        #    They are what set the scale: the eye reads the reactor as filling
-        #    the room rather than sitting in the middle of it.
-        if W > 40 and H > 40:
-            m, arm = min(W, H) * 0.035, min(W, H) * 0.055
-            p.setPen(QPen(blend(main, 0.45), 1.4))
-            for sx, sy in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
-                x = cx + sx * (W / 2 - m)
-                y = cy + sy * (H / 2 - m)
-                p.drawLine(QLineF(x, y, x - sx * arm, y))
-                p.drawLine(QLineF(x, y, x, y - sy * arm))
+        camAz = ((math.sin(2.0 * math.pi * tNorm) * 0.08) if (not is_muted) else 0.0) + self._user_rot_y
+        camEl = ((math.cos(2.0 * math.pi * tNorm) * 0.05) if (not is_muted) else 0.0) + self._user_rot_x
 
-        # 3. Crosshair across the full canvas, broken around the core so it
-        #    frames the reactor rather than crossing it.
-        p.setPen(QPen(blend(main, 0.16), 1))
-        gap = r * 0.62
-        if W > 40:
-            p.drawLine(QLineF(cx - W / 2, cy, cx - gap, cy))
-            p.drawLine(QLineF(cx + gap, cy, cx + W / 2, cy))
-        if H > 40:
-            p.drawLine(QLineF(cx, cy - H / 2, cx, cy - gap))
-            p.drawLine(QLineF(cx, cy + gap, cx, cy + H / 2))
+        camPos = (
+            cameraDistance * math.sin(camAz) * math.cos(camEl),
+            cameraDistance * math.sin(camEl),
+            cameraDistance * math.cos(camAz) * math.cos(camEl)
+        )
 
-        # 4. Two thin outer circles. Sparse on purpose — a dense ring reads as a
-        #    grey band at this size, and restraint is what made the original
-        #    look expensive.
-        for rr, a in ((1.00, 0.34), (0.93, 0.16)):
-            rad = r * rr
-            p.setPen(QPen(blend(main, a), 1))
-            p.drawEllipse(QRectF(cx - rad, cy - rad, rad * 2, rad * 2))
+        cDist = math.sqrt(camPos[0]**2 + camPos[1]**2 + camPos[2]**2)
+        fwd = (-camPos[0]/cDist, -camPos[1]/cDist, -camPos[2]/cDist)
 
-        # 5. Long, sparse graduations: 24 majors reaching well in from the rim,
-        #    with shorter minors between them.
-        major, minor = [], []
-        for i in range(72):
-            a = math.radians(i * 5.0)
-            ca, sa = math.cos(a), math.sin(a)
-            if i % 3 == 0:
-                major.append(QLineF(cx + ca * r * 0.885, cy + sa * r * 0.885,
-                                    cx + ca * r * 0.985, cy + sa * r * 0.985))
+        rx = fwd[1]*0.0 - fwd[2]*1.0
+        ry = fwd[2]*0.0 - fwd[0]*0.0
+        rz = fwd[0]*1.0 - fwd[1]*0.0
+        rLen = math.sqrt(rx*rx + ry*ry + rz*rz)
+        if rLen < 0.001:
+            rx, ry, rz, rLen = 1.0, 0.0, 0.0, 1.0
+        right = (rx/rLen, ry/rLen, rz/rLen)
+
+        up = (
+            right[1]*fwd[2] - right[2]*fwd[1],
+            right[2]*fwd[0] - right[0]*fwd[2],
+            right[0]*fwd[1] - right[1]*fwd[0]
+        )
+
+        camRot = [
+            right[0], right[1], right[2],
+            up[0], up[1], up[2],
+            fwd[0], fwd[1], fwd[2]
+        ]
+
+        speechTime = self._tick * 0.1
+        amp_factor = max(0.4, min(2.5, amp * 3.5)) if is_speaking else 0.0
+        speechHarmonic1 = (math.sin(speechTime * 5.2) * 6.0 + math.sin(speechTime * 11.3) * 3.5) * amp_factor
+        speechHarmonic2 = (math.cos(speechTime * 7.4) * 5.0 + math.sin(speechTime * 14.1) * 2.5) * amp_factor
+        speechSyllablePulse = max(0.0, math.sin(speechTime * 2.8)) * 8.0 * amp_factor
+
+        # 1. Acoustic Ripples (Listening Mode)
+        if is_listening or (curRadiusScale > 1.05 and not is_muted):
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for rip in range(3):
+                rip_t = ((tNorm * 6.4) + rip * 0.33) % 1.0
+                r_rip = (35.0 + rip_t * 360.0) * curRadiusScale
+                rip_alpha = int((1.0 - rip_t) * 115 * min(1.0, 0.4 + amp * 3.0))
+                p.setPen(QPen(QColor(255, 215, 0, rip_alpha), 1.5))
+                R1 = self.getRingMat(1, tNorm)
+                pts_rip = []
+                for i in range(41):
+                    a = i * (2.0 * math.pi / 40)
+                    p3d = _transformVec((r_rip * math.cos(a), r_rip * math.sin(a), 0.0), R1)
+                    sx, sy, _ = self.projectPt(p3d, camPos, camRot, f, cx, cy)
+                    pts_rip.append(QPointF(sx, sy))
+                for i in range(40):
+                    p.drawLine(QLineF(pts_rip[i], pts_rip[i + 1]))
+
+        # 2. 3D Chords
+        if not is_muted:
+            for chord in self._chords:
+                R1 = self.getRingMat(chord['ring1'], tNorm)
+                R2 = self.getRingMat(chord['ring2'], tNorm)
+
+                r1_eff = chord['r1'] * curRadiusScale
+                r2_eff = chord['r2'] * curRadiusScale
+
+                p1_3d = _transformVec((r1_eff * math.cos(chord['a1']), r1_eff * math.sin(chord['a1']), 0.0), R1)
+                p2_3d = _transformVec((r2_eff * math.cos(chord['a2']), r2_eff * math.sin(chord['a2']), 0.0), R2)
+
+                sx1, sy1, sz1 = self.projectPt(p1_3d, camPos, camRot, f, cx, cy)
+                sx2, sy2, sz2 = self.projectPt(p2_3d, camPos, camRot, f, cx, cy)
+
+                avgZ = (sz1 + sz2) * 0.5
+                depthF = min(1.0, max(0.2, (1400.0 - avgZ) / 500.0)) * breathPulse
+                alpha = int(depthF * 102)
+                p.setPen(QPen(QColor(255, 175, 40, alpha), 1.0))
+                p.drawLine(QLineF(QPointF(sx1, sy1), QPointF(sx2, sy2)))
+
+        # 3. Concentric Gimbal Rings & Encoder Ticks
+        for ring in self._gimbal_rings:
+            R = self.getRingMat(ring['rid'], tNorm)
+            pts2d = []
+            avgZ = 0.0
+            r_scaled = ring['r'] * curRadiusScale
+
+            num_segs = ring['segs']
+            for i in range(num_segs):
+                ang = i * (2.0 * math.pi / num_segs)
+                waveR = r_scaled
+                if is_speaking and ring['rid'] >= 3:
+                    waveR += math.sin(ang * 8.0 + speechTime * 6.0) * speechHarmonic1 * 0.3
+                p3d = _transformVec((waveR * math.cos(ang), waveR * math.sin(ang), 0.0), R)
+                sx, sy, sz = self.projectPt(p3d, camPos, camRot, f, cx, cy)
+                pts2d.append((QPointF(sx, sy), sz))
+                avgZ += sz
+
+            avgZ /= num_segs
+            depthF = min(1.3, max(0.4, (1400.0 - avgZ) / 500.0)) * (0.65 if is_muted else breathPulse)
+
+            col = ring['col']
+            pen_w = max(0.8, ring['thk'] * depthF)
+            p.setPen(QPen(col, pen_w))
+            for i in range(num_segs):
+                p1, _ = pts2d[i]
+                p2, _ = pts2d[(i + 1) % num_segs]
+                p.drawLine(QLineF(p1, p2))
+
+            # Optical encoder ticks
+            if ring['enc'] and not is_muted:
+                tick_step = 2 if is_thinking else 3
+                tick_col = QColor(255, 255, 255, 220) if is_listening else QColor(255, 242, 117, 200)
+                p.setPen(QPen(tick_col, 1.0))
+                for i in range(0, num_segs, tick_step):
+                    ang = i * (2.0 * math.pi / num_segs)
+                    pTick = _transformVec(((r_scaled + 6.0) * math.cos(ang), (r_scaled + 6.0) * math.sin(ang), 0.0), R)
+                    sx_t, sy_t, _ = self.projectPt(pTick, camPos, camRot, f, cx, cy)
+                    p.drawLine(QLineF(pts2d[i][0], QPointF(sx_t, sy_t)))
+
+        # 4. Segmented Arc Shields
+        for sh in self._shields:
+            R = self.getRingMat(sh['ring'], tNorm)
+            interlockExt = curArmorInterlock * 0.38
+            startAng = sh['start'] - interlockExt
+            endAng = sh['end'] + interlockExt
+            segs = sh['segs']
+            dAng = (endAng - startAng) / segs
+            rIn_scaled = sh['rIn'] * curRadiusScale
+            rOut_scaled = sh['rOut'] * curRadiusScale
+
+            fill_col = QColor(180, 120, 20, 190) if is_muted else QColor(218, 140, 20, int(90 * breathPulse))
+            stroke_col = QColor(212, 175, 55, 240) if is_muted else QColor(255, 234, 167, 240)
+            stroke_w = 2.0 if is_muted else 1.5
+
+            for k in range(segs):
+                a1 = startAng + k * dAng
+                a2 = a1 + dAng * 0.92
+
+                p1_3d = _transformVec((rIn_scaled * math.cos(a1), rIn_scaled * math.sin(a1), 0.0), R)
+                p2_3d = _transformVec((rOut_scaled * math.cos(a1), rOut_scaled * math.sin(a1), 0.0), R)
+                p3_3d = _transformVec((rOut_scaled * math.cos(a2), rOut_scaled * math.sin(a2), 0.0), R)
+                p4_3d = _transformVec((rIn_scaled * math.cos(a2), rIn_scaled * math.sin(a2), 0.0), R)
+
+                s1x, s1y, _ = self.projectPt(p1_3d, camPos, camRot, f, cx, cy)
+                s2x, s2y, _ = self.projectPt(p2_3d, camPos, camRot, f, cx, cy)
+                s3x, s3y, _ = self.projectPt(p3_3d, camPos, camRot, f, cx, cy)
+                s4x, s4y, _ = self.projectPt(p4_3d, camPos, camRot, f, cx, cy)
+
+                poly = QPolygonF([QPointF(s1x, s1y), QPointF(s2x, s2y), QPointF(s3x, s3y), QPointF(s4x, s4y)])
+                p.setBrush(QBrush(fill_col))
+                p.setPen(QPen(stroke_col, stroke_w))
+                p.drawPolygon(poly)
+
+        # 5. Dendritic Circuitry
+        if curCircuitActivity > 0.05:
+            for branch in self._circuit_branches:
+                R = self.getRingMat(branch['ring'], tNorm)
+                pulsePhase = (tNorm * branch['speed'] * curCircuitActivity + branch['offset']) % 1.0
+                activeIdx = int(pulsePhase * (len(branch['pts']) - 1))
+
+                scrPts = []
+                for pt in branch['pts']:
+                    r_eff = pt[0] * curRadiusScale
+                    p3d = _transformVec((r_eff * math.cos(pt[1]), r_eff * math.sin(pt[1]), pt[2]), R)
+                    sx, sy, _ = self.projectPt(p3d, camPos, camRot, f, cx, cy)
+                    scrPts.append(QPointF(sx, sy))
+
+                for s in range(len(scrPts) - 1):
+                    isPulse = (s == activeIdx)
+                    if isPulse:
+                        p.setPen(QPen(QColor(255, 255, 255, 255), 2.5))
+                    else:
+                        p.setPen(QPen(QColor(255, 175, 45, int(165 * breathPulse)), 1.0))
+                    p.drawLine(QLineF(scrPts[s], scrPts[s + 1]))
+
+        # 6. Central Reactor Core
+        R_inner = self.getRingMat('core_inner', tNorm)
+        R_eye = self.getRingMat('core_eye', tNorm)
+
+        # Core radial spokes (16 spokes)
+        if not is_muted:
+            numSpokes = 16
+            p.setPen(QPen(QColor(255, 185, 50, int(180 * breathPulse)), 1.0))
+            for s in range(numSpokes):
+                ang = s * (2.0 * math.pi / numSpokes)
+                r1_eff = 20.0 * curCoreScale
+                r2_eff = (95.0 + (speechHarmonic1 if is_speaking else 0.0)) * curCoreScale
+                p1 = self.projectPt(_transformVec((r1_eff * math.cos(ang), r1_eff * math.sin(ang), 0.0), R_inner), camPos, camRot, f, cx, cy)
+                p2 = self.projectPt(_transformVec((r2_eff * math.cos(ang), r2_eff * math.sin(ang), 0.0), R_inner), camPos, camRot, f, cx, cy)
+                p.drawLine(QLineF(QPointF(p1[0], p1[1]), QPointF(p2[0], p2[1])))
+
+        # Swirling turbine blades (12 blades)
+        if not is_muted:
+            blade_col = QColor(255, 255, 255, 240) if is_thinking else QColor(255, 209, 102, 230)
+            p.setPen(QPen(blade_col, 1.8))
+            for s in range(12):
+                angBase = s * (2.0 * math.pi / 12)
+                curve_factor = 0.6 if is_thinking else 0.38
+                b_pts = []
+                for st in range(8):
+                    r_b = (22.0 + st * 8.5) * curCoreScale
+                    if is_speaking:
+                        r_b += math.sin(st * 2.0 + speechTime * 10.0) * speechHarmonic2 * 0.4
+                    th_b = angBase + curve_factor * math.log(1.0 + st * 0.65)
+                    p3d = _transformVec((r_b * math.cos(th_b), r_b * math.sin(th_b), 0.0), R_inner)
+                    bx, by, _ = self.projectPt(p3d, camPos, camRot, f, cx, cy)
+                    b_pts.append(QPointF(bx, by))
+                for st in range(len(b_pts) - 1):
+                    p.drawLine(QLineF(b_pts[st], b_pts[st + 1]))
+
+        # Core concentric rings (4 rings)
+        if not is_muted and curCoreScale > 0.1:
+            coreRings = [
+                {'r': 24.0, 'col': QColor(255, 255, 255, 250), 'thk': 2.5, 'R': R_eye},
+                {'r': 42.0, 'col': QColor(255, 209, 102, 240), 'thk': 2.0, 'R': R_inner},
+                {'r': 62.0, 'col': QColor(255, 170, 0, 230),   'thk': 1.8, 'R': R_eye},
+                {'r': 85.0, 'col': QColor(251, 86, 7, 210),    'thk': 1.5, 'R': R_inner},
+            ]
+            for cr in coreRings:
+                p.setPen(QPen(cr['col'], cr['thk']))
+                c_pts = []
+                for i in range(61):
+                    ang = i * (2.0 * math.pi / 60)
+                    r_wave = cr['r'] * curCoreScale
+                    if is_speaking:
+                        r_wave += math.sin(ang * 6.0 + speechTime * 12.0) * speechHarmonic1 * 0.6 + math.cos(ang * 12.0 - speechTime * 8.0) * speechHarmonic2 * 0.4
+                    p3d = _transformVec((r_wave * math.cos(ang), r_wave * math.sin(ang), 0.0), cr['R'])
+                    sx, sy, _ = self.projectPt(p3d, camPos, camRot, f, cx, cy)
+                    c_pts.append(QPointF(sx, sy))
+                for i in range(60):
+                    p.drawLine(QLineF(c_pts[i], c_pts[i + 1]))
+
+        # Central Eye Singularity (Aperture Iris + Radiant Golden Aura + Singularity Core Bead)
+        coreCenter = self.projectPt((0.0, 0.0, 0.0), camPos, camRot, f, cx, cy)
+        cc_x, cc_y = coreCenter[0], coreCenter[1]
+        coreRad = (16.0 * curCoreScale) + (speechSyllablePulse if is_speaking else 0.0)
+        if is_thinking:
+            coreRad += 6.0
+
+        if not is_muted and curCoreScale > 0.15:
+            aura_rad = coreRad * (4.5 if is_thinking else 3.5)
+            # 1. Outer radiant golden aura
+            g_aura = QRadialGradient(cc_x, cc_y, aura_rad)
+            if is_thinking:
+                g_aura.setColorAt(0.0, QColor(255, 255, 255, 255))
+                g_aura.setColorAt(0.25, QColor(255, 220, 80, 240))
+                g_aura.setColorAt(0.60, QColor(251, 133, 0, 160))
+                g_aura.setColorAt(1.0, QColor(0, 0, 0, 0))
             else:
-                minor.append(QLineF(cx + ca * r * 0.945, cy + sa * r * 0.945,
-                                    cx + ca * r * 0.985, cy + sa * r * 0.985))
-        p.setPen(QPen(blend(main, 0.42), 1.3))
-        p.drawLines(major)
-        p.setPen(QPen(blend(main, 0.18), 1))
-        p.drawLines(minor)
+                g_aura.setColorAt(0.0, QColor(255, 255, 255, 245))
+                g_aura.setColorAt(0.25, QColor(255, 200, 50, 220))
+                g_aura.setColorAt(0.60, QColor(251, 133, 0, 120))
+                g_aura.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.setBrush(QBrush(g_aura))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QPointF(cc_x, cc_y), aura_rad, aura_rad)
 
-        # 6. Sweeping arcs. Long spans, not dashes — the original's grandeur
-        #    came from a few big strokes. Speed is the state: idle drifts,
-        #    thinking hurries, speaking runs.
-        rate = 1.0 + (1.9 if self.state in ("THINKING", "PROCESSING") else 0.0) \
-                   + (1.2 if self.speaking else 0.0)
-        for k, (rr, span, count, dirn, col, a, wid) in enumerate((
-                (0.955, 118, 2, +1, acc,  0.75, 2.0),
-                (0.845, 82,  3, -1, main, 0.38, 1.3),
-                (0.760, 150, 1, +1, acc,  0.45, 1.6),
-                (0.660, 64,  4, -1, main, 0.26, 1.1),
-                (0.545, 128, 2, +1, main, 0.30, 1.2))):
-            rad = r * rr
-            p.setPen(QPen(blend(col, a), wid))
-            box = QRectF(cx - rad, cy - rad, rad * 2, rad * 2)
-            base = (t * rate * (9 + k * 6) * dirn) % 360.0
-            for sgm in range(count):
-                p.drawArc(box, int((base + sgm * (360.0 / count)) * 16),
-                          int(span * 16))
+            # 2. Inner aperture event horizon (crisp small black pupil)
+            pupil_rad = coreRad * 0.45
+            p.setBrush(QBrush(QColor(0, 0, 0, 255)))
+            p.setPen(QPen(QColor(255, 180, 20, 200), 1.0))
+            p.drawEllipse(QPointF(cc_x, cc_y), pupil_rad, pupil_rad)
 
-        # 7. The voice, as a ring of graduations that grow with it. Kept out at
-        #    a wide radius so it never crowds the middle.
-        n = 60
-        ring = r * 0.415
-        spikes = []
-        for i in range(n):
-            a = math.radians(i * (360.0 / n))
-            ca, sa = math.cos(a), math.sin(a)
-            wob = 0.5 + 0.5 * math.sin(t * 2.3 + i * 0.42)
-            idle = 0.018 + 0.012 * math.sin(t * 1.2 + i * 0.7)
-            h = r * (idle + (amp * 0.20 * wob if live else 0.0))
-            spikes.append(QLineF(cx + ca * ring, cy + sa * ring,
-                                 cx + ca * (ring + h), cy + sa * (ring + h)))
-        p.setPen(QPen(blend(acc if live else main, 0.25 + 0.5 * amp), 1.6))
-        p.drawLines(spikes)
+            # 3. Singularity core bead (white glowing fusion spark in center)
+            bead_rad = (5.0 if is_thinking else 3.0) * (curBloom ** 0.5)
+            p.setBrush(QBrush(QColor(255, 255, 255, 255)))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QPointF(cc_x, cc_y), bead_rad, bead_rad)
 
-        # 8. The inner ring the name sits in.
-        inner = r * 0.355
-        p.setPen(QPen(blend(acc, 0.30 + 0.45 * amp), 1.5))
-        p.drawEllipse(QRectF(cx - inner, cy - inner, inner * 2, inner * 2))
+        elif is_muted:
+            p.setBrush(QBrush(QColor(139, 105, 20, 230)))
+            p.setPen(QPen(QColor(212, 175, 55, 240), 1.5))
+            p.drawEllipse(QPointF(cc_x, cc_y), 6.0, 6.0)
 
-        # 9. The name, sized from the string rather than from the radius alone:
-        #    "J.A.R.V.I.S" and a name someone renamed to "MAX" are very
-        #    different widths, and a fixed fraction of r spills one of them past
-        #    the ring it is supposed to sit inside.
-        name = self._assistant_name or ""
-        if name:
-            space = max(1.0, r * 0.018)
-            fsz = max(8, int(min(r * 0.105,
-                                 (inner * 1.75) / max(1, len(name)) * 1.6 - space)))
-            f = QFont("Courier New", fsz, QFont.Weight.Bold)
-            f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, space)
-            p.setFont(f)
-            p.setPen(QPen(blend(qcol(C.WHITE), 0.6 + 0.4 * min(1.0, amp * 2)), 1))
-            p.drawText(QRectF(cx - r, cy - fsz, r * 2, fsz * 2),
-                       Qt.AlignmentFlag.AlignCenter, name)
+        # 7. Floating Golden Embers
+        if not is_muted:
+            activeCount = 480 if is_thinking else (180 if is_sleeping else 360)
+            for i in range(min(activeCount, len(self._particles))):
+                part = self._particles[i]
+                u = part['u0'] + 2.0 * math.pi * part['fa'] * tNorm
+                v = part['v0'] + 2.0 * math.pi * part['fb'] * tNorm
+
+                burstDist = (math.sin((speechTime * 4.0) + (i % 5)) * 18.0) if is_speaking else 0.0
+                r_eff = (part['r'] + burstDist) * curRadiusScale
+
+                px = r_eff * math.sin(u) * math.cos(v)
+                py = r_eff * math.sin(u) * math.sin(v)
+                pz = r_eff * math.cos(u)
+
+                sx, sy, sz = self.projectPt((px, py, pz), camPos, camRot, f, cx, cy)
+                depthF = min(1.4, max(0.3, (1400.0 - sz) / 500.0)) * breathPulse
+                pt_size = max(0.8, part['size'] * depthF)
+
+                if part['type'] == 'white':
+                    p_col = QColor(255, 255, 255, int(255 * depthF))
+                elif part['type'] == 'gold':
+                    p_col = QColor(255, 209, 102, int(220 * depthF))
+                else:
+                    p_col = QColor(251, 133, 0, int(180 * depthF))
+
+                p.setBrush(QBrush(p_col))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawEllipse(QPointF(sx, sy), pt_size, pt_size)
 
     def paintEvent(self, _):
         p = QPainter(self)
-        if not p.isActive():      # device not ready (e.g. 0-size during layout) — skip cleanly
+        if not p.isActive():
             return
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), qcol(C.BG))
@@ -850,18 +1087,12 @@ class HudCanvas(QWidget):
         cx, cy = W / 2, H / 2
         fw = min(W, H)
 
-        # grid dots — blitted from a cached layer; rebuilt only when the size
-        # or the theme's ghost colour changes (so live re-theming still works).
         _gkey = (W, H, C.PRI_GHO)
         if self._grid_cache is None or self._grid_key != _gkey:
             self._grid_cache = self._make_grid(W, H)
             self._grid_key   = _gkey
         p.drawPixmap(0, 0, self._grid_cache)
 
-        # ── holographic head ────────────────────────────────────────────────
-        # Sized to the band between the top of the canvas and the status line,
-        # capped by width, so it fills the HUD at any window size — including
-        # fullscreen — without ever colliding with the status text below.
         _sy_status = cy + fw * 0.40
         if self._avatar is not None and self.hud_style == "face":
             _band_t = 12.0
@@ -882,11 +1113,6 @@ class HudCanvas(QWidget):
                 else:
                     _acc = qcol(C.PRI)
             self._avatar.paint(p, cx, _head_cy, _r_head, _main, _acc, qcol(C.BG))
-
-        # reactor core — the other centrepiece, and the fallback if the head
-        # could not be built. There is no third path: the old face.png branch
-        # was unreachable (no such file ships) and the bare orb it fell through
-        # to is what this replaces.
         else:
             _band_t = 12.0
             _band_h = max(60.0, _sy_status - 12.0 - _band_t)
@@ -6447,7 +6673,7 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
         lay.addStretch()
-        lay.addWidget(_fl("By FatihMakes", C.PRI_DIM))
+        lay.addWidget(_fl("By RIO", C.PRI_DIM))
         return w
 
     def _on_file_selected(self, path: str):

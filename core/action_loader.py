@@ -159,8 +159,27 @@ class ActionRegistry:
         if rec is None or not rec.valid:
             return f"Action '{name}' is not available."
         try:
-            return _call_handler(rec.handler, parameters, ctx or {}) or "Done."
+            res = _call_handler(rec.handler, parameters, ctx or {}) or "Done."
+            # Check for non-exception tool failure returns that can be self-healed
+            if isinstance(res, str) and (res.startswith("Error:") or res.startswith("Failed:")):
+                try:
+                    from core.self_healing import heal_action
+                    healed, healed_res = heal_action(name, parameters, res, rec.handler, ctx or {})
+                    if healed:
+                        return healed_res
+                except Exception:
+                    pass
+            return res
         except Exception as e:
+            # Self-healing CodeAct loop: attempt automatic recovery
+            try:
+                from core.self_healing import heal_action
+                healed, healed_res = heal_action(name, parameters, str(e), rec.handler, ctx or {})
+                if healed:
+                    return healed_res
+            except Exception as heal_exc:
+                self._logger(f"[SelfHealing] Recovery failed: {heal_exc}")
+
             self._logger(f"Action '{name}' crashed during run(): {e}")
             traceback.print_exc()
             return f"Tool '{name}' failed: {e}"

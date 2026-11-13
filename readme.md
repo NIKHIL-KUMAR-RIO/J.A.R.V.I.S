@@ -1,7 +1,8 @@
-# ⚙️ MARK LVI (56)
-### The Ultimate Cross-Platform Personal AI Assistant — By FatihMakes
+# ⚙️ MARK LVI (56) — Custom Edition
+### The Ultimate Cross-Platform Personal AI Assistant — Customized by RIO
+#### Original Architecture by FatihMakes
 
-> 📺 **[Watch the full setup video on YouTube](https://www.youtube.com/@FatihMakes)**
+> 📺 **[Watch the original setup video on YouTube](https://www.youtube.com/@FatihMakes)**
 
 A real-time voice AI that can hear, see, speak, and control your computer — on any OS. Supports Windows, macOS, and Linux. Built on the Gemini Live API for native audio streaming, delivering zero subscriptions and total digital autonomy.
 
@@ -40,6 +41,21 @@ rounding it off to "done". Opening an app watches the process table for it.
 Closing one asks the application politely, then checks whether it went.
 
 It's not just an assistant — it's an extension of your digital life.
+
+---
+
+## ⚡ New Integrations & Custom Features (by RIO)
+
+- **🧠 BM25 Hybrid Memory & SQLite Knowledge Base**:
+  - Upgraded semantic memory retrieval with Okapi BM25 scoring and exponential recency decay.
+  - SQLite knowledge store (`knowledge.db`) indexing conversation summaries, user preferences, and structured facts.
+- **🛡️ Self-Healing CodeAct Agent Engine**:
+  - Automatic error classification, self-healing execution loop, and parameter auto-correction.
+  - Automatic package dependency installer (`pip install`) on runtime `ModuleNotFoundError`.
+- **📱 Telegram Remote Pro**:
+  - Full remote control over Telegram with interactive action pad and customizable buttons.
+  - Audio voice note transcription via Gemini 3.5 Flash with automatic offline `faster-whisper` fallback.
+  - Startup backlog purging (prevents old commands from replaying on boot) and sleep-state command gating.
 
 ---
 
@@ -714,12 +730,11 @@ Licensed under **[Creative Commons BY-NC 4.0](https://creativecommons.org/licens
 
 ---
 
-## 👤 Connect with the Creator
+## 👤 Credits & Original Creator
 
-Engineered by a developer building a real-world JARVIS-style assistant.
-⭐ **Star the repository to support the journey to Mark 100.**
+With deep appreciation and respect to the original creator of the Mark LVI architecture:
+- **Original Creator & Engineering**: **FatihMakes**
+- **YouTube**: [@FatihMakes](https://www.youtube.com/@FatihMakes)
+- **Instagram**: [@fatihmakes](https://www.instagram.com/fatihmakes)
 
-| Platform | Link |
-|---|---|
-| YouTube | [@FatihMakes](https://www.youtube.com/@FatihMakes) |
-| Instagram | [@fatihmakes](https://www.instagram.com/fatihmakes) |
+Custom integrations, hybrid BM25 memory engine, self-healing CodeAct agent loop, and Telegram remote control developed by **RIO**.

@@ -1,5 +1,7 @@
 import json
+import math
 import re
+import sqlite3
 from datetime import datetime
 from threading import Lock
 from pathlib import Path
@@ -14,6 +16,7 @@ def get_base_dir() -> Path:
 
 BASE_DIR         = get_base_dir()
 MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
+DB_PATH          = BASE_DIR / "memory" / "knowledge.db"
 _lock            = Lock()
 MAX_VALUE_LENGTH = 380
 
@@ -115,6 +118,57 @@ def _trim_to_limit(memory: dict) -> dict:
             pass
     return memory
 
+def _init_sqlite() -> None:
+    """Initialize the SQLite database for indexed knowledge and facts."""
+    try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(DB_PATH), timeout=5.0) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS facts (
+                    category TEXT,
+                    key TEXT,
+                    value TEXT,
+                    updated TEXT,
+                    PRIMARY KEY(category, key)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT,
+                    title TEXT,
+                    content TEXT,
+                    created_at TEXT
+                )
+            """)
+            conn.commit()
+    except Exception as e:
+        print(f"[Memory] ⚠️ SQLite init warning: {e}")
+
+
+def _sync_to_sqlite(memory: dict) -> None:
+    """Sync memory dictionary to SQLite knowledge database for indexing and querying."""
+    try:
+        _init_sqlite()
+        with sqlite3.connect(str(DB_PATH), timeout=5.0) as conn:
+            cur = conn.cursor()
+            for cat, items in memory.items():
+                if not isinstance(items, dict):
+                    continue
+                for key, entry in items.items():
+                    val = _entry_value(entry)
+                    if not val:
+                        continue
+                    up = (entry.get("updated", "") if isinstance(entry, dict) else "") or datetime.now().strftime("%Y-%m-%d")
+                    cur.execute(
+                        "INSERT OR REPLACE INTO facts (category, key, value, updated) VALUES (?, ?, ?, ?)",
+                        (cat, key, val, up),
+                    )
+            conn.commit()
+    except Exception as e:
+        print(f"[Memory] ⚠️ SQLite sync warning: {e}")
+
+
 def save_memory(memory: dict) -> None:
     if not isinstance(memory, dict):
         return
@@ -125,6 +179,7 @@ def save_memory(memory: dict) -> None:
             json.dumps(memory, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    _sync_to_sqlite(memory)
 
 
 def _truncate_value(val: str) -> str:
@@ -324,38 +379,99 @@ def format_memory_for_prompt(memory: dict | None) -> str:
     return "\n".join(out) + "\n"
 
 
-# ── Recall ────────────────────────────────────────────────────────────────────
+# ── BM25 & Semantic Hybrid Recall Engine (OpenJarvis Inspired) ─────────────────
 
-def _score(query_words: list[str], cat: str, key: str, value: str) -> int:
-    """Cheap lexical relevance. No embeddings, no network, no model call - this
-    runs in well under a millisecond, which is the entire point: recall must
-    cost one model round trip, never two."""
-    hay_key = _pretty(key).lower()
-    hay_val = value.lower()
-    score   = 0
-    for w in query_words:
-        if not w:
-            continue
-        if w == hay_key:
-            score += 10
-        elif w in hay_key:
-            score += 6
-        if w in hay_val:
-            score += 3
-        if w in cat:
-            score += 1
-    return score
+class BM25MemoryEngine:
+    """
+    Okapi BM25 ranking engine combined with hybrid key/category bonuses
+    and exponential recency decay. Inspired by OpenJarvis BM25 & Hybrid storage.
+    """
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+
+    @staticmethod
+    def tokenize(text: str) -> list[str]:
+        return [w for w in re.split(r"[^\w]+", (text or "").lower()) if len(w) > 1]
+
+    def score_entries(self, query: str, entries: list[dict]) -> list[tuple[float, dict]]:
+        query_terms = self.tokenize(query)
+        if not query_terms:
+            return [(1.0, e) for e in entries]
+
+        N = len(entries)
+        if N == 0:
+            return []
+
+        doc_tokens = []
+        doc_lengths = []
+        df: dict[str, int] = {}
+        for entry in entries:
+            toks = self.tokenize(f"{entry.get('key', '')} {entry.get('value', '')} {entry.get('category', '')}")
+            doc_tokens.append(toks)
+            doc_lengths.append(len(toks))
+            for t in set(toks):
+                df[t] = df.get(t, 0) + 1
+
+        avgdl = sum(doc_lengths) / max(1, N)
+        now_dt = datetime.now()
+        scored: list[tuple[float, dict]] = []
+
+        for idx, entry in enumerate(entries):
+            toks = doc_tokens[idx]
+            d_len = doc_lengths[idx]
+            bm25 = 0.0
+
+            tf: dict[str, int] = {}
+            for t in toks:
+                tf[t] = tf.get(t, 0) + 1
+
+            for q in query_terms:
+                n_q = df.get(q, 0)
+                if n_q == 0:
+                    continue
+                # Okapi BM25 formula
+                idf = math.log(1.0 + (N - n_q + 0.5) / (n_q + 0.5))
+                f_q = tf.get(q, 0)
+                denom = f_q + self.k1 * (1.0 - self.b + self.b * (d_len / max(1.0, avgdl)))
+                bm25 += idf * ((f_q * (self.k1 + 1.0)) / max(0.001, denom))
+
+            # Hybrid Bonus 1: Key exact or partial match
+            key_clean = _pretty(entry.get("key", "")).lower()
+            key_boost = 0.0
+            for q in query_terms:
+                if q == key_clean:
+                    key_boost += 14.0
+                elif q in key_clean:
+                    key_boost += 7.0
+                if q in entry.get("category", "").lower():
+                    key_boost += 2.5
+
+            # Hybrid Bonus 2: Recency decay (recent facts get a relevance boost)
+            recency_boost = 1.0
+            updated_str = entry.get("updated", "")
+            if updated_str:
+                try:
+                    up_dt = datetime.strptime(updated_str, "%Y-%m-%d")
+                    days_ago = max(0, (now_dt - up_dt).days)
+                    recency_boost = 1.0 + 1.8 * math.exp(-days_ago / 30.0)
+                except Exception:
+                    pass
+
+            total_score = (bm25 + key_boost) * recency_boost
+            if total_score > 0:
+                scored.append((total_score, entry))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored
 
 
 def search_memory(query: str, limit: int = 8) -> str:
-    """Find stored facts matching `query`. Backs the recall_memory tool.
-
-    An empty query is treated as "show me everything you know", capped - the
-    model asks that when the user says "what do you remember about me?"."""
+    """Find stored facts matching `query` using BM25 semantic scoring and SQLite indexing.
+    Backs the recall_memory tool.
+    """
     memory = load_memory()
-    words  = [w for w in re.split(r"[^\w]+", (query or "").lower()) if len(w) > 1]
-
-    rows: list[tuple[int, str, str, str]] = []
+    flat_entries = []
     for cat, items in memory.items():
         if not isinstance(items, dict):
             continue                     # skip 'sessions', which is a list
@@ -363,21 +479,93 @@ def search_memory(query: str, limit: int = 8) -> str:
             val = _entry_value(entry)
             if not val:
                 continue
-            s = _score(words, cat, key, val) if words else 1
-            if s > 0:
-                rows.append((s, cat, key, val))
+            up = (entry.get("updated", "") if isinstance(entry, dict) else "")
+            flat_entries.append({
+                "category": cat,
+                "key": key,
+                "value": val,
+                "updated": up,
+            })
 
-    if not rows:
+    engine = BM25MemoryEngine()
+    scored = engine.score_entries(query, flat_entries)
+
+    # Also search SQLite document knowledge if query provided
+    doc_matches = search_documents(query, limit=3) if query else []
+
+    if not scored and not doc_matches:
         return (f"Nothing stored about '{query}'." if query
                 else "I have not stored anything about this person yet.")
 
-    rows.sort(key=lambda r: (-r[0], r[2]))
-    lines = [f"{cat}/{_pretty(key)}: {val}" for _s, cat, key, val in rows[:max(1, limit)]]
-    head  = (f"Stored facts matching '{query}':" if query
-             else "Everything currently stored:")
-    more  = (f"\n(+{len(rows) - len(lines)} more — search with a narrower keyword)"
-             if len(rows) > len(lines) else "")
-    return head + "\n" + "\n".join(lines) + more
+    lines = []
+    for _score, item in scored[:max(1, limit)]:
+        lines.append(f"{item['category']}/{_pretty(item['key'])}: {item['value']}")
+
+    head = (f"Stored facts matching '{query}':" if query
+            else "Everything currently stored:")
+    more = (f"\n(+{len(scored) - len(lines)} more — search with a narrower keyword)"
+            if len(scored) > len(lines) else "")
+
+    result_text = head + "\n" + "\n".join(lines) + more
+
+    if doc_matches:
+        result_text += "\n\n[KNOWLEDGE & DOCUMENTS]:"
+        for d in doc_matches:
+            result_text += f"\n- {d['title']}: {d['content'][:180]}…"
+
+    return result_text
+
+
+def index_document(content: str, title: str = "", source: str = "") -> str:
+    """Store arbitrary knowledge or document excerpts in SQLite knowledge base."""
+    if not content or not content.strip():
+        return "No content provided to index."
+    try:
+        _init_sqlite()
+        with sqlite3.connect(str(DB_PATH), timeout=5.0) as conn:
+            conn.execute(
+                "INSERT INTO documents (source, title, content, created_at) VALUES (?, ?, ?, ?)",
+                (source or "direct_input", title or "Untitled Document", content.strip(), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            conn.commit()
+        return f"Successfully indexed knowledge: '{title or 'Document'}' ({len(content)} chars)."
+    except Exception as e:
+        return f"Failed to index knowledge: {e}"
+
+
+def search_documents(query: str, limit: int = 4) -> list[dict]:
+    """Retrieve document chunks from SQLite matching query using BM25."""
+    if not query:
+        return []
+    try:
+        _init_sqlite()
+        with sqlite3.connect(str(DB_PATH), timeout=5.0) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id, title, source, content, created_at FROM documents")
+            rows = cur.fetchall()
+
+        if not rows:
+            return []
+
+        doc_entries = []
+        for r in rows:
+            doc_entries.append({
+                "id": r[0],
+                "title": r[1] or "",
+                "source": r[2] or "",
+                "content": r[3] or "",
+                "key": r[1] or "",
+                "value": r[3] or "",
+                "category": "document",
+                "created_at": r[4] or "",
+            })
+
+        engine = BM25MemoryEngine()
+        scored = engine.score_entries(query, doc_entries)
+        return [doc for _score, doc in scored[:limit]]
+    except Exception as e:
+        print(f"[Memory] ⚠️ Document search warning: {e}")
+        return []
 
 
 def all_entries_for_ui() -> list[dict]:
@@ -451,6 +639,11 @@ def save_session_summary(summary: str, language: str = "") -> None:
             json.dumps(memory, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    # Index session summary into SQLite knowledge base for long-term recall
+    try:
+        index_document(summary, title=f"Conversation on {entry['date']}", source="session_history")
+    except Exception:
+        pass
     print(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
 
 

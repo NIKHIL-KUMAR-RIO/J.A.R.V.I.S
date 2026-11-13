@@ -231,6 +231,25 @@ def _run_file(path: Path, args: list, timeout: int) -> str:
         )
         output = result.stdout.strip()
         error  = result.stderr.strip()
+
+        # Self-healing: auto-install missing packages and retry immediately
+        if error and ("modulenotfounderror" in error.lower() or "no module named" in error.lower()):
+            try:
+                from core.self_healing import _extract_missing_module, _try_pip_install
+                pkg = _extract_missing_module(error)
+                if pkg and _try_pip_install(pkg):
+                    print(f"[Code] 🩹 Re-running {path.name} after auto-installing {pkg}...")
+                    result = subprocess.run(
+                        interp + [str(path)] + (args or []),
+                        capture_output=True, text=True,
+                        encoding="utf-8", errors="replace",
+                        timeout=timeout, cwd=str(path.parent)
+                    )
+                    output = result.stdout.strip()
+                    error  = result.stderr.strip()
+            except Exception:
+                pass
+
         parts  = []
         if output: parts.append(f"Output:\n{output}")
         if error:  parts.append(f"Stderr:\n{error}")

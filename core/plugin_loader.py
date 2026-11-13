@@ -69,6 +69,7 @@ class PluginRecord:
     #          is in force. Nothing is deleted: Gemini still gets the full text.
     tier: Optional[str] = None
     brief: Optional[str] = None
+    startup: Optional[Callable] = None
 
 
 class PluginRegistry:
@@ -168,6 +169,22 @@ class PluginRegistry:
             })
         return out
 
+    def run_startup(self, player=None) -> None:
+        """Invoke optional module-level on_startup(player=...) for enabled plugins."""
+        for name, rec in self._plugins.items():
+            if not rec.valid or rec.startup is None or not get_plugin_enabled(name):
+                continue
+            try:
+                sig = inspect.signature(rec.startup)
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                if has_var_kw or "player" in sig.parameters:
+                    rec.startup(player=player)
+                else:
+                    rec.startup()
+            except Exception as e:
+                self._logger(f"Plugin '{name}' startup hook failed: {e}")
+                traceback.print_exc()
+
 
 def _call_run(run_fn, parameters, player, session_memory):
     """Invoke run() passing only the kwargs it actually declares (or all of them
@@ -216,12 +233,15 @@ def _validate(module, filename: str) -> PluginRecord:
     if not (isinstance(settings, dict) and isinstance(settings.get("fields"), list)):
         settings = None
 
+    startup_fn = getattr(module, "on_startup", None)
+
     return PluginRecord(name=name, description=description.strip(), parameters=parameters,
                          run=run_fn, file=filename, valid=True, error="", settings=settings,
                          behavior=_opt_upper(plugin_meta.get("behavior"), _BEHAVIORS),
                          scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING),
                          tier=_opt_tier(plugin_meta.get("tier")),
-                         brief=_opt_text(plugin_meta.get("brief")))
+                         brief=_opt_text(plugin_meta.get("brief")),
+                         startup=startup_fn if callable(startup_fn) else None)
 
 
 # The app's own top-level packages. Named explicitly rather than only probed on

@@ -90,7 +90,7 @@ from core.wake_word            import (
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
-WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
+WAKE_SLEEP_TIMEOUT = 300.0   # seconds (5 minutes)
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -763,7 +763,8 @@ class JarvisLive:
             if speaking:
                 continue
             if (time.monotonic() - self._last_user_speech) > self._wake_sleep_timeout:
-                self.sleep(reason="no speech for 2 minutes")
+                mins = max(1, round(self._wake_sleep_timeout / 60))
+                self.sleep(reason=f"no speech for {mins} minute{'s' if mins != 1 else ''}")
 
     # ── Wake word: UI callbacks (called from the Qt thread) ──────────────────
 
@@ -2408,6 +2409,7 @@ class JarvisLive:
             log  = self.ui.write_log,
         )
         set_trim_notifier(self.ui.write_log)
+        self._plugin_registry.run_startup(player=self.ui)
 
         # Tell the device picker the exact rates the streams open at, from the
         # constants that actually open them — so it can never list a device that
